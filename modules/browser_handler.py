@@ -47,6 +47,11 @@ def get_user_agent():
     config = get_config()
     return config.get("Playwright", "user_agent", fallback=None)
 
+def get_parallel_query_count():
+    """Get the parallel query count from config."""
+    config = get_config()
+    return config.getint("Playwright", "parallel_query_count", fallback=1)
+
 async def get_playwright_async():
     """Starts Playwright if not already started."""
     global _playwright_instance

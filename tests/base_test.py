@@ -59,7 +59,7 @@ key3 = True
 [Search]
 search_query_templates = tech companies in ${country}
 country = Australia
-scroll_count = 1
+max_companies_per_query = 5
 
 [Database]
 db_name = test_database.db

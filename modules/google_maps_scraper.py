@@ -2,6 +2,10 @@ import asyncio
 import json
 import urllib.parse
 import re
+import asyncio
+import json
+import urllib.parse
+import re
 from modules.config_manager import ConfigManager
 from modules.database_manager import DatabaseManager
 from modules.logger_config import setup_logging
@@ -93,13 +97,13 @@ class GoogleMapsScraper:
         
         return cleaned if cleaned else "N/A"
 
-    async def scrape(self, query):
+    async def scrape(self, query, context=None):
         logger.info(f"Starting scrape for query: {query}")
         browser = None
-        context = None
         page = None
         max_retries = 3
         retry_count = 0
+        context_provided = context is not None
         
         while retry_count < max_retries:
             try:
@@ -107,8 +111,11 @@ class GoogleMapsScraper:
                 # Check internet connection before starting scrape
                 wait_for_internet()
                 
-                browser = await launch_browser_async(headless=self.headless)
-                context = await create_context_with_cookies_async(browser)
+                # If no context provided, create browser and context (legacy mode)
+                if not context_provided:
+                    browser = await launch_browser_async(headless=self.headless)
+                    context = await create_context_with_cookies_async(browser)
+                
                 page = await context.new_page()
                 
                 # Check internet before navigation with retry on restore
@@ -156,7 +163,7 @@ class GoogleMapsScraper:
                 
             except InternetRestoredException:
                 logger.warning(f"Internet connection restored during scraping setup for query '{query}'. Retrying (Attempt {retry_count}/{max_retries})...")
-                if browser:
+                if browser and not context_provided:
                     await close_browser_async()
                     browser = None
                 if retry_count >= max_retries:
@@ -166,13 +173,13 @@ class GoogleMapsScraper:
                 
             except ConnectionError as ce:
                 logger.error(f"Connection error during scraping setup for query '{query}': {ce}. Aborting retries.")
-                if browser:
+                if browser and not context_provided:
                     await close_browser_async()
                 return
                 
             except Exception as e:
                 logger.error(f"Unexpected error during scraping setup for query '{query}' on attempt {retry_count}: {e}")
-                if browser:
+                if browser and not context_provided:
                     await close_browser_async()
                     browser = None
                 if retry_count >= max_retries:
@@ -447,9 +454,18 @@ class GoogleMapsScraper:
         except Exception as e:
             logger.error(f"An unexpected error occurred during scraping for query \'{query}\': {e}")
         finally:
-            if browser:
+            # Close page if it was created
+            if page:
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.error(f"Error closing page for query '{query}': {e}")
+            
+            # Only close browser if we created it (legacy mode)
+            if browser and not context_provided:
                 await close_browser_async()
-            logger.info(f"Finished scrape for query: {query}. Processed {processed_companies_count} companies.")
+            
+            logger.info(f"Finished scrape for query: {query}. Processed {processed_companies_count if 'processed_companies_count' in locals() else 0} companies.")
 
     async def _extract_company_info(self, page, name):
         """Extract company information from the detail page using multiple fallback strategies."""

@@ -22,7 +22,7 @@ class TestGoogleMapsScraper(BaseAsyncTest):
 
     async def test_scrape(self):
         # This is an integration test that will actually hit Google Maps
-        # It's important to keep the scroll_count low for testing purposes
+        # It's important to keep the max_companies_per_query low for testing purposes
         
         # Check if we should run in headless mode
         headless_mode = self.get_playwright_headless_setting()
