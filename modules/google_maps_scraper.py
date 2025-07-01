@@ -24,6 +24,11 @@ class GoogleMapsScraper:
         self.email_finder = EmailFinder()
         self.headless = self.config.getboolean("Playwright", "headless", fallback=True)
         self.max_companies_per_query = self.config.getint("Search", "max_companies_per_query", fallback=25)
+        
+        # Scrolling configuration
+        self.scroll_wait_time = self.config.getint("Search", "scroll_wait_time", fallback=3000)
+        self.max_empty_scrolls = self.config.getint("Search", "max_empty_scrolls", fallback=3)
+        self.retry_scroll_attempts = self.config.getint("Search", "retry_scroll_attempts", fallback=2)
 
     def clean_text(self, text):
         """
@@ -185,6 +190,8 @@ class GoogleMapsScraper:
             
             # Continue scrolling and processing until we reach the company limit
             scroll_iteration = 0
+            consecutive_empty_scrolls = 0
+            
             while processed_companies_count < max_companies:
                 scroll_iteration += 1
                 logger.info(f"Scrolling down results for '{query}' (scroll {scroll_iteration}) - {processed_companies_count}/{max_companies} companies processed")
@@ -192,15 +199,43 @@ class GoogleMapsScraper:
                 # Check internet before scrolling
                 wait_for_internet()
                 await page.evaluate(f"document.querySelector({escaped_results_pane_selector}).scrollTop = document.querySelector({escaped_results_pane_selector}).scrollHeight")
-                await page.wait_for_timeout(2000)  # Wait for content to load
+                await page.wait_for_timeout(self.scroll_wait_time)  # Wait for content to load using configurable time
 
                 # Get all company links using semantic attributes instead of fragile classes
                 # Target anchor tags with business-specific characteristics
-                company_elements = await page.query_selector_all("a[aria-label][href*='/maps/place/']")
-                logger.info(f"Found {len(company_elements)} potential company elements after scroll {scroll_iteration}.")
+                initial_company_elements = await page.query_selector_all("a[aria-label][href*='/maps/place/']")
+                logger.info(f"Found {len(initial_company_elements)} potential company elements after scroll {scroll_iteration}.")
 
                 companies_processed_this_scroll = 0
-                for j, element in enumerate(company_elements):
+                current_company_index = 0
+                max_attempts_per_scroll = len(initial_company_elements) + 5  # Add buffer for dynamic loading
+                attempts_this_scroll = 0
+                
+                while current_company_index < max_attempts_per_scroll and attempts_this_scroll < max_attempts_per_scroll:
+                    attempts_this_scroll += 1
+                    
+                    # Re-fetch elements to avoid stale element references
+                    fresh_company_elements = await page.query_selector_all("a[aria-label][href*='/maps/place/']")
+                    
+                    # Check if we still have elements at the current index
+                    if current_company_index >= len(fresh_company_elements):
+                        logger.debug(f"Current index {current_company_index} exceeds available elements {len(fresh_company_elements)}. Breaking.")
+                        break
+                    
+                    element = fresh_company_elements[current_company_index]
+                    current_company_index += 1
+                    
+                    # Verify element is still valid before processing
+                    try:
+                        # Try to get a basic attribute to verify element is attached
+                        test_attr = await element.get_attribute("href")
+                        if not test_attr:
+                            logger.debug(f"Skipping invalid element at index {current_company_index - 1}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Element at index {current_company_index - 1} is stale, skipping: {e}")
+                        continue
+                    
                     # Check if we've reached our company limit
                     if processed_companies_count >= max_companies:
                         logger.info(f"Reached maximum companies limit ({max_companies}) for query '{query}'")
@@ -346,6 +381,11 @@ class GoogleMapsScraper:
                                 
                             except Exception as e:
                                 logger.error(f"Unexpected error processing company {name} on attempt {company_retry_count}: {e}")
+                                # Check if it's a stale element error
+                                if "not attached to the DOM" in str(e) or "Element is not attached" in str(e):
+                                    logger.warning(f"Stale element detected for {name}. Will refetch elements in next iteration.")
+                                    company_processed_successfully = True  # Skip this element and let refetch handle it
+                                    break
                                 if company_retry_count >= max_company_retries:
                                     company_processed_successfully = True  # Mark as processed to avoid infinite loop
                                     break
@@ -370,16 +410,39 @@ class GoogleMapsScraper:
                             # If we can't go back, we might be stuck, so break the loop for this query
                             break
                 
+                # Track empty scrolls for improved end-detection
+                if companies_processed_this_scroll == 0:
+                    consecutive_empty_scrolls += 1
+                    logger.info(f"No new companies found in scroll {scroll_iteration}. Empty scrolls: {consecutive_empty_scrolls}/{self.max_empty_scrolls}")
+                    
+                    # Try additional scrolls and waits before giving up
+                    if consecutive_empty_scrolls < self.max_empty_scrolls:
+                        # Get current element count before retry
+                        current_elements = await page.query_selector_all("a[aria-label][href*='/maps/place/']")
+                        current_count = len(current_elements)
+                        
+                        # Try some additional retry scrolls to make sure content isn't still loading
+                        for retry_attempt in range(self.retry_scroll_attempts):
+                            logger.info(f"Retry scroll attempt {retry_attempt + 1}/{self.retry_scroll_attempts} for scroll {scroll_iteration}")
+                            await page.evaluate(f"document.querySelector({escaped_results_pane_selector}).scrollTop = document.querySelector({escaped_results_pane_selector}).scrollHeight")
+                            await page.wait_for_timeout(self.scroll_wait_time)
+                            
+                            # Check if new elements appeared after the retry
+                            retry_elements = await page.query_selector_all("a[aria-label][href*='/maps/place/']")
+                            if len(retry_elements) > current_count:
+                                logger.info(f"Found new elements after retry scroll attempt {retry_attempt + 1}")
+                                consecutive_empty_scrolls = 0  # Reset counter since we found new content
+                                break
+                        continue  # Continue to next scroll iteration
+                    else:
+                        logger.info(f"Reached maximum consecutive empty scrolls ({self.max_empty_scrolls}). Ending search.")
+                        break
+                else:
+                    consecutive_empty_scrolls = 0  # Reset counter when we find new companies
+                
                 # Break the outer loop if we've reached our company limit
                 if processed_companies_count >= max_companies:
                     break
-                
-                # If no new companies were processed in this scroll, we might have reached the end
-                if companies_processed_this_scroll == 0:
-                    logger.info(f"No new companies found in scroll {scroll_iteration}. Might have reached end of results.")
-                    # Try one more scroll to be sure
-                    if scroll_iteration > 1:  # Only break if we've scrolled at least twice
-                        break
 
         except Exception as e:
             logger.error(f"An unexpected error occurred during scraping for query \'{query}\': {e}")
