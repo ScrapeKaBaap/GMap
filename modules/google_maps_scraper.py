@@ -7,6 +7,7 @@ from modules.database_manager import DatabaseManager
 from modules.logger_config import setup_logging
 from modules.email_finder import EmailFinder
 from modules.browser_handler import launch_browser_async, create_context_with_cookies_async, close_browser_async
+from modules.internet_utils import wait_for_internet, InternetRestoredException
 
 logger = setup_logging()
 
@@ -92,26 +93,92 @@ class GoogleMapsScraper:
         browser = None
         context = None
         page = None
-        try:
-            browser = await launch_browser_async(headless=self.headless)
-            context = await create_context_with_cookies_async(browser)
-            page = await context.new_page()
-            await page.goto("https://www.google.com/maps", wait_until="domcontentloaded")
-
-            # Search for the query
-            await page.fill("input#searchboxinput", query)
-            await page.press("input#searchboxinput", "Enter")
-            
-            # Wait for the search results to appear.
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
             try:
-                results_pane_selector = "div[aria-label^=\"Results for\"]"
-                await page.wait_for_selector(results_pane_selector, timeout=60000)
-            except Exception as e:
-                logger.error(f"Timeout waiting for search results container for query \'{query}\': {e}")
+                retry_count += 1
+                # Check internet connection before starting scrape
+                wait_for_internet()
+                
+                browser = await launch_browser_async(headless=self.headless)
+                context = await create_context_with_cookies_async(browser)
+                page = await context.new_page()
+                
+                # Check internet before navigation with retry on restore
+                initial_nav_successful = False
+                while not initial_nav_successful:
+                    try:
+                        wait_for_internet(raise_on_restore=True)
+                        await page.goto("https://www.google.com/maps", wait_until="domcontentloaded")
+                        initial_nav_successful = True
+                    except InternetRestoredException:
+                        logger.warning(f"Internet restored during initial navigation for query '{query}'. Reloading page...")
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=90000)
+                            initial_nav_successful = True
+                        except Exception as reload_e:
+                            logger.error(f"Failed to reload page after internet restoration for query '{query}': {reload_e}")
+                            raise ConnectionError(f"Failed to reload page for query '{query}'")
+
+                # Search for the query
+                await page.fill("input#searchboxinput", query)
+                await page.press("input#searchboxinput", "Enter")
+                
+                # Wait for the search results to appear.
+                try:
+                    results_pane_selector = "div[aria-label^=\"Results for\"]"
+                    wait_for_internet(raise_on_restore=True)
+                    await page.wait_for_selector(results_pane_selector, timeout=60000)
+                except InternetRestoredException:
+                    logger.warning(f"Internet restored during search results loading for query '{query}'. Reloading page...")
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=90000)
+                        # Re-search after reload
+                        await page.fill("input#searchboxinput", query)
+                        await page.press("input#searchboxinput", "Enter")
+                        await page.wait_for_selector(results_pane_selector, timeout=60000)
+                    except Exception as reload_e:
+                        logger.error(f"Failed to reload page after internet restoration for query '{query}': {reload_e}")
+                        raise ConnectionError(f"Failed to reload page for query '{query}'")
+                except Exception as e:
+                    logger.error(f"Timeout waiting for search results container for query \'{query}\': {e}")
+                    return
+
+                # Successfully completed the initial setup - break the retry loop
+                break
+                
+            except InternetRestoredException:
+                logger.warning(f"Internet connection restored during scraping setup for query '{query}'. Retrying (Attempt {retry_count}/{max_retries})...")
+                if browser:
+                    await close_browser_async()
+                    browser = None
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to setup scraping for query '{query}' after {max_retries} attempts due to repeated internet interruptions.")
+                    return
+                continue
+                
+            except ConnectionError as ce:
+                logger.error(f"Connection error during scraping setup for query '{query}': {ce}. Aborting retries.")
+                if browser:
+                    await close_browser_async()
                 return
-
+                
+            except Exception as e:
+                logger.error(f"Unexpected error during scraping setup for query '{query}' on attempt {retry_count}: {e}")
+                if browser:
+                    await close_browser_async()
+                    browser = None
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to setup scraping for query '{query}' after {max_retries} attempts.")
+                    return
+                continue
+        
+        # If we reach here, the setup was successful, continue with the main scraping logic
+        try:
+            results_pane_selector = "div[aria-label^=\"Results for\"]"
             escaped_results_pane_selector = json.dumps(results_pane_selector)
-
             logger.debug(f"Results pane selector: {escaped_results_pane_selector}")
             processed_companies_count = 0
             max_companies = self.max_companies_per_query
@@ -121,6 +188,9 @@ class GoogleMapsScraper:
             while processed_companies_count < max_companies:
                 scroll_iteration += 1
                 logger.info(f"Scrolling down results for '{query}' (scroll {scroll_iteration}) - {processed_companies_count}/{max_companies} companies processed")
+                
+                # Check internet before scrolling
+                wait_for_internet()
                 await page.evaluate(f"document.querySelector({escaped_results_pane_selector}).scrollTop = document.querySelector({escaped_results_pane_selector}).scrollHeight")
                 await page.wait_for_timeout(2000)  # Wait for content to load
 
@@ -180,73 +250,125 @@ class GoogleMapsScraper:
                     
                     if name and not self.db_manager.company_exists(name, query):
                         logger.info(f"Processing company: {name}")
-                        try:
-                            # Click the element directly
-                            await element.click()
-                            logger.info(f"Waiting for detail page to load for {name}...")
-                            
-                            # Wait for the detail page to load using a more reliable selector
-                            # Look for the main heading (h1) that contains the business name
-                            # Use a more flexible approach that doesn't rely on exact aria-label match
+                        company_processed_successfully = False
+                        company_retry_count = 0
+                        max_company_retries = 3
+                        
+                        while company_retry_count < max_company_retries and not company_processed_successfully:
+                            company_retry_count += 1
                             try:
-                                # Try multiple selectors for the business name heading
-                                await page.wait_for_selector("h1", timeout=10000)
-                                # Additional wait for any dynamic content loading
-                                await page.wait_for_timeout(2000)
-                            except:
-                                # Fallback: wait for any content in the detail pane
-                                await page.wait_for_selector("div[role='main']", timeout=10000)
-                                await page.wait_for_timeout(2000)
-                            
-                            logger.info(f"Detail page loaded for {name}. Extracting info...")
-
-                            # Extract information using the new method
-                            company_info = await self._extract_company_info(page, name)
-                            
-                            if company_info and company_info.get('name'):
-                                logger.info(f"Successfully extracted info for {company_info['name']}.")
+                                logger.info(f"Attempt {company_retry_count}/{max_company_retries} for company: {name}")
                                 
-                                # Extract email if website is available
-                                email = "N/A"
-                                website = company_info.get('website', 'N/A')
-                                if website and website != "N/A":
-                                    domain = website.replace("http://", "").replace("https://", "").split("/")[0]
-                                    email = self.email_finder.find_email(domain)
-                                    logger.info(f"Found email for {name}: {email}")
+                                # Check internet before clicking
+                                wait_for_internet(raise_on_restore=True)
+                                
+                                # Click the element directly
+                                await element.click()
+                                logger.info(f"Waiting for detail page to load for {name}...")
+                                
+                                # Wait for the detail page to load using a more reliable selector
+                                # Look for the main heading (h1) that contains the business name
+                                # Use a more flexible approach that doesn't rely on exact aria-label match
+                                detail_load_successful = False
+                                while not detail_load_successful:
+                                    try:
+                                        wait_for_internet(raise_on_restore=True)
+                                        # Try multiple selectors for the business name heading
+                                        await page.wait_for_selector("h1", timeout=10000)
+                                        # Additional wait for any dynamic content loading
+                                        await page.wait_for_timeout(2000)
+                                        detail_load_successful = True
+                                    except InternetRestoredException:
+                                        logger.warning(f"Internet restored during detail page load for {name}. Reloading page...")
+                                        try:
+                                            await page.reload(wait_until="domcontentloaded", timeout=90000)
+                                            detail_load_successful = True
+                                        except Exception as reload_e:
+                                            logger.error(f"Failed to reload detail page for {name} after internet restoration: {reload_e}")
+                                            raise ConnectionError(f"Failed to reload detail page for {name}")
+                                    except Exception:
+                                        # Fallback: wait for any content in the detail pane
+                                        try:
+                                            await page.wait_for_selector("div[role='main']", timeout=10000)
+                                            await page.wait_for_timeout(2000)
+                                            detail_load_successful = True
+                                        except Exception as fallback_e:
+                                            logger.error(f"Failed to load detail page for {name}: {fallback_e}")
+                                            raise ConnectionError(f"Failed to load detail page for {name}")
+                                
+                                logger.info(f"Detail page loaded for {name}. Extracting info...")
 
-                                # Clean all extracted data before database insertion
-                                clean_name = self.clean_text(company_info.get('name', name))
-                                clean_address = self.clean_text(company_info.get('address', 'N/A'))
-                                clean_phone = self.clean_phone(company_info.get('phone', 'N/A'))
-                                clean_website = self.clean_website(website)
-                                clean_email = self.clean_email(email)
+                                # Extract information using the new method
+                                company_info = await self._extract_company_info(page, name)
+                                
+                                if company_info and company_info.get('name'):
+                                    logger.info(f"Successfully extracted info for {company_info['name']}.")
+                                    
+                                    # Extract email if website is available
+                                    email = "N/A"
+                                    website = company_info.get('website', 'N/A')
+                                    if website and website != "N/A":
+                                        domain = website.replace("http://", "").replace("https://", "").split("/")[0]
+                                        email = self.email_finder.find_email(domain)
+                                        logger.info(f"Found email for {name}: {email}")
 
-                                self.db_manager.insert_company(
-                                    clean_name,
-                                    clean_address,
-                                    clean_phone,
-                                    clean_website,
-                                    clean_email,
-                                    query
-                                )
-                            else:
-                                logger.warning(f"Failed to extract complete info for {name}.")
-                            logger.info(f"Inserted company: {name}")
-                            processed_companies_count += 1
-                            companies_processed_this_scroll += 1
+                                    # Clean all extracted data before database insertion
+                                    clean_name = self.clean_text(company_info.get('name', name))
+                                    clean_address = self.clean_text(company_info.get('address', 'N/A'))
+                                    clean_phone = self.clean_phone(company_info.get('phone', 'N/A'))
+                                    clean_website = self.clean_website(website)
+                                    clean_email = self.clean_email(email)
 
-                        except Exception as e:
-                            logger.warning(f"Could not process company {name}: {e}")
-                            # If an error occurs, we need to ensure we are back to the search results list
-                            # to continue with the next company. The back button is the most reliable way.
-                            try:
-                                await page.go_back()
-                                await page.wait_for_selector(results_pane_selector, timeout=30000) # Wait for search results to be visible again
-                                logger.info(f"Navigated back to search results after error for {name}.")
-                            except Exception as back_e:
-                                logger.error(f"Failed to navigate back to search results after error for {name}: {back_e}")
-                                # If we can't go back, we might be stuck, so break the loop for this query
+                                    self.db_manager.insert_company(
+                                        clean_name,
+                                        clean_address,
+                                        clean_phone,
+                                        clean_website,
+                                        clean_email,
+                                        query
+                                    )
+                                    logger.info(f"Inserted company: {name}")
+                                    processed_companies_count += 1
+                                    companies_processed_this_scroll += 1
+                                    company_processed_successfully = True
+                                else:
+                                    logger.warning(f"Failed to extract complete info for {name}.")
+                                    company_processed_successfully = True  # Mark as processed even if extraction failed
+                                
+                            except InternetRestoredException:
+                                logger.warning(f"Internet connection restored during processing company {name}. Retrying (Attempt {company_retry_count}/{max_company_retries})...")
+                                # The loop will continue to the next retry attempt
+                                
+                            except ConnectionError as ce:
+                                logger.error(f"Connection error processing company {name}: {ce}. Aborting retries for this company.")
+                                company_processed_successfully = True  # Mark as processed to avoid infinite loop
                                 break
+                                
+                            except Exception as e:
+                                logger.error(f"Unexpected error processing company {name} on attempt {company_retry_count}: {e}")
+                                if company_retry_count >= max_company_retries:
+                                    company_processed_successfully = True  # Mark as processed to avoid infinite loop
+                                    break
+                                # Continue to next retry attempt
+                        
+                        if not company_processed_successfully:
+                            logger.error(f"Failed to process company {name} after {max_company_retries} attempts due to repeated interruptions or errors.")
+                            
+                        # Navigate back to search results if not already there
+                        try:
+                            # Check if we're still on the detail page
+                            current_url = page.url
+                            if "/maps/place/" in current_url:
+                                logger.debug(f"Navigating back to search results from {name}")
+                                wait_for_internet()
+                                await page.go_back()
+                                results_pane_selector = "div[aria-label^=\"Results for\"]"
+                                await page.wait_for_selector(results_pane_selector, timeout=30000)
+                                logger.debug(f"Successfully navigated back to search results.")
+                        except Exception as back_e:
+                            logger.error(f"Failed to navigate back to search results after processing {name}: {back_e}")
+                            # If we can't go back, we might be stuck, so break the loop for this query
+                            break
                 
                 # Break the outer loop if we've reached our company limit
                 if processed_companies_count >= max_companies:
