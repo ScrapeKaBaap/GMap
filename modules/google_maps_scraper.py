@@ -29,6 +29,28 @@ class GoogleMapsScraper:
         self.headless = self.config.getboolean("Playwright", "headless", fallback=True)
         self.max_companies_per_query = self.config.getint("Search", "max_companies_per_query", fallback=25)
         
+        # Email checking configuration
+        self.email_check_enabled = self.config.getboolean("Email", "check", fallback=False)
+        
+        # Import email checking functions only if needed
+        if self.email_check_enabled:
+            try:
+                import sys
+                import os
+                # Add the mail directory to the path
+                mail_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'mail')
+                sys.path.append(mail_dir)
+                from check import check_and_update_email, load_config as load_email_config
+                self.check_and_update_email = check_and_update_email
+                # Load email configuration
+                load_email_config()
+                logger.info("Email checking enabled and configured")
+            except ImportError as e:
+                logger.error(f"Failed to import email checking functions: {e}")
+                self.email_check_enabled = False
+        else:
+            logger.info("Email checking disabled in configuration")
+        
         # Scrolling configuration
         self.scroll_wait_time = self.config.getint("Search", "scroll_wait_time", fallback=3000)
         self.max_empty_scrolls = self.config.getint("Search", "max_empty_scrolls", fallback=3)
@@ -370,6 +392,24 @@ class GoogleMapsScraper:
                                         query
                                     )
                                     logger.info(f"Inserted company: {name}")
+                                    
+                                    # Check email if enabled and email is found
+                                    if self.email_check_enabled and clean_email and clean_email != "N/A":
+                                        try:
+                                            # Get the company ID from the database
+                                            company_id = self.db_manager.get_last_inserted_company_id()
+                                            if company_id:
+                                                logger.info(f"Checking email {clean_email} for company {clean_name}")
+                                                success = self.check_and_update_email(clean_email, company_id)
+                                                if success:
+                                                    logger.info(f"Successfully checked and updated email for {clean_name}")
+                                                else:
+                                                    logger.warning(f"Failed to check email for {clean_name}")
+                                            else:
+                                                logger.warning(f"Could not get company ID for {clean_name}, skipping email check")
+                                        except Exception as email_check_error:
+                                            logger.error(f"Error checking email for {clean_name}: {email_check_error}")
+                                    
                                     processed_companies_count += 1
                                     companies_processed_this_scroll += 1
                                     company_processed_successfully = True

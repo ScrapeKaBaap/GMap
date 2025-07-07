@@ -55,6 +55,14 @@ class DatabaseManager:
             print(f"Error inserting company: {e}")
             return False
 
+    def get_last_inserted_company_id(self):
+        """Get the ID of the last inserted company."""
+        try:
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"Error getting last inserted company ID: {e}")
+            return None
+
     def company_exists(self, name, search_query):
         self.cursor.execute("SELECT 1 FROM companies WHERE name = ? AND search_query = ?", (name, search_query))
         return self.cursor.fetchone() is not None
