@@ -249,6 +249,26 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
     """Process all companies from database."""
     import sqlite3
 
+    # Initialize database manager for storing results and ensure schema
+    # Get the geo_mail root directory (parent of addons)
+    current_file = os.path.abspath(__file__)
+    static_generator_dir = os.path.dirname(current_file)  # addons/static-generator
+    addons_dir = os.path.dirname(static_generator_dir)    # addons
+    geo_mail_root = os.path.dirname(addons_dir)           # geo_mail
+
+    # Import directly from the addons directory
+    import importlib.util
+    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
+    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
+    database_manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(database_manager_module)
+    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
+    db_manager = EmailDatabaseManager(db_path)
+
+    # Ensure both emails table and companies table have required columns
+    db_manager.ensure_emails_table()
+    db_manager.ensure_companies_table_columns()
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -284,23 +304,6 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
         return
 
     logger.info(f"Processing {len(companies)} companies for static email generation...")
-
-    # Initialize database manager for storing results
-    # Get the geo_mail root directory (parent of addons)
-    current_file = os.path.abspath(__file__)
-    static_generator_dir = os.path.dirname(current_file)  # addons/static-generator
-    addons_dir = os.path.dirname(static_generator_dir)    # addons
-    geo_mail_root = os.path.dirname(addons_dir)           # geo_mail
-
-    # Import directly from the addons directory
-    import importlib.util
-    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
-    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
-    database_manager_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(database_manager_module)
-    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
-    db_manager.ensure_emails_table()
 
     total_emails_generated = 0
 

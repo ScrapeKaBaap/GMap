@@ -178,30 +178,125 @@ class MailScraperAddon(EmailFinderAddon):
             if self.ignore_queries:
                 cmd.append('-ignore-queries=true')
             
+            import re
+
             logger.info(f"Running email extractor for {domain} with depth {self.depth}")
-            
-            # Run the command
-            result = subprocess.run(
+            logger.debug(f"Command: {' '.join(cmd)}")
+
+            # Function to strip ANSI color codes
+            def strip_ansi_codes(text):
+                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                return ansi_escape.sub('', text)
+
+            # Run the command with real-time output logging
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout // 1000 + 60,  # Convert to seconds and add buffer
+                bufsize=1,  # Line buffered
+                universal_newlines=True,
                 cwd=os.path.dirname(os.path.abspath(__file__))
             )
-            
-            if result.returncode == 0:
-                return True
-            else:
-                print(f"Email extractor failed for domain {domain}. Return code: {result.returncode}")
-                if result.stderr:
-                    print(f"Stderr: {result.stderr}")
+
+            logger.debug(f"Email extractor started for {domain} (PID: {process.pid})")
+
+            # Read output in real-time with proper line buffering
+            import threading
+            import queue
+
+            stdout_lines = []
+            stderr_lines = []
+            output_queue = queue.Queue()
+
+            def read_stdout():
+                """Read stdout in a separate thread"""
+                try:
+                    for line in iter(process.stdout.readline, ''):
+                        if line:
+                            clean_line = strip_ansi_codes(line.rstrip('\n\r'))
+                            if clean_line:
+                                output_queue.put(('stdout', clean_line))
+                except Exception as e:
+                    output_queue.put(('error', f"Error reading stdout: {e}"))
+                finally:
+                    process.stdout.close()
+
+            def read_stderr():
+                """Read stderr in a separate thread"""
+                try:
+                    for line in iter(process.stderr.readline, ''):
+                        if line:
+                            clean_line = strip_ansi_codes(line.rstrip('\n\r'))
+                            if clean_line:
+                                output_queue.put(('stderr', clean_line))
+                except Exception as e:
+                    output_queue.put(('error', f"Error reading stderr: {e}"))
+                finally:
+                    process.stderr.close()
+
+            # Start reader threads
+            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+
+            try:
+                # Process output as it comes in
+                while process.poll() is None or not output_queue.empty():
+                    try:
+                        output_type, line = output_queue.get(timeout=1.0)
+                        if output_type == 'stdout':
+                            stdout_lines.append(line)
+                            logger.debug(f"  {line}")
+                        elif output_type == 'stderr':
+                            stderr_lines.append(line)
+                            logger.debug(f"  STDERR: {line}")
+                        elif output_type == 'error':
+                            logger.error(f"  {line}")
+                    except queue.Empty:
+                        continue
+
+                # Wait for process to complete
+                return_code = process.wait(timeout=self.timeout // 1000 + 60)
+
+                # Wait for threads to finish
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+
+                # Process any remaining output
+                while not output_queue.empty():
+                    try:
+                        output_type, line = output_queue.get_nowait()
+                        if output_type == 'stdout':
+                            stdout_lines.append(line)
+                            logger.debug(f"  {line}")
+                        elif output_type == 'stderr':
+                            stderr_lines.append(line)
+                            logger.debug(f"  STDERR: {line}")
+                    except queue.Empty:
+                        break
+
+                if return_code == 0:
+                    logger.debug(f"Email extractor completed successfully for {domain}")
+                    return True
+                else:
+                    logger.error(f"Email extractor failed for domain {domain}. Return code: {return_code}")
+                    if stderr_lines:
+                        logger.error(f"Stderr: {'; '.join(stderr_lines)}")
+                    return False
+
+            except subprocess.TimeoutExpired:
+                logger.error(f"Email extractor timed out for domain {domain}")
+                process.kill()
                 return False
-                
-        except subprocess.TimeoutExpired:
-            print(f"Email extractor timeout for domain: {domain}")
-            return False
+            except Exception as e:
+                logger.error(f"Error running email extractor for domain {domain}: {e}")
+                process.kill()
+                return False
+
         except Exception as e:
-            logger.error(f"Error running email extractor for domain {domain}: {e}")
+            logger.error(f"Unexpected error running email extractor for domain {domain}: {e}")
             return False
     
     def find_emails(self, company: CompanyInfo) -> List[EmailResult]:
@@ -306,6 +401,25 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
     import sqlite3
     import time
 
+    # Initialize database manager for storing results and ensure schema
+    # Get the correct path to addons directory
+    current_file = os.path.abspath(__file__)
+    scraper_dir = os.path.dirname(current_file)          # addons/mail-scraper
+    addons_dir = os.path.dirname(scraper_dir)            # addons
+
+    # Import directly from the addons directory
+    import importlib.util
+    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
+    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
+    database_manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(database_manager_module)
+    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
+    db_manager = EmailDatabaseManager(db_path)
+
+    # Ensure both emails table and companies table have required columns
+    db_manager.ensure_emails_table()
+    db_manager.ensure_companies_table_columns()
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -341,22 +455,6 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
         return
 
     print(f"Processing {len(companies)} companies for email scraping...")
-
-    # Initialize database manager for storing results
-    # Get the correct path to addons directory
-    current_file = os.path.abspath(__file__)
-    scraper_dir = os.path.dirname(current_file)          # addons/mail-scraper
-    addons_dir = os.path.dirname(scraper_dir)            # addons
-
-    # Import directly from the addons directory
-    import importlib.util
-    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
-    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
-    database_manager_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(database_manager_module)
-    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
-    db_manager.ensure_emails_table()
 
     total_emails_scraped = 0
 
@@ -418,22 +516,31 @@ def main():
 
     args = parser.parse_args()
 
-    # Load confidence from geo_mail config
+    # Load configuration from geo_mail config
     try:
         geo_config = load_geo_mail_config()
         confidence = geo_config.getfloat("EmailFinders", "scraper_confidence", fallback=0.9)
+        config_depth = geo_config.getint("EmailFinders", "scraper_depth", fallback=-1)
+        config_limit_emails = geo_config.getint("EmailFinders", "scraper_limit_emails", fallback=50)
+        config_limit_urls = geo_config.getint("EmailFinders", "scraper_limit_urls", fallback=25)
+        config_timeout = geo_config.getint("EmailFinders", "scraper_timeout", fallback=10000)
     except:
         confidence = 0.9
+        config_depth = -1
+        config_limit_emails = 50
+        config_limit_urls = 25
+        config_timeout = 10000
 
     # Get addon directory for relative paths
     addon_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Configure addon
+    # Configure addon - use config.ini values if available, otherwise use command line args
+    # Note: -1 means infinity in the scraper binary, so we should pass it through
     config = {
-        'depth': args.depth,
-        'limit_emails': args.limit_emails,
-        'limit_urls': args.limit_urls,
-        'timeout': args.timeout,
+        'depth': config_depth if config_depth is not None else args.depth,
+        'limit_emails': config_limit_emails if config_limit_emails != -1 else args.limit_emails,
+        'limit_urls': config_limit_urls if config_limit_urls != -1 else args.limit_urls,
+        'timeout': config_timeout if config_timeout != -1 else args.timeout,
         'extractor_bin_path': os.path.join(addon_dir, 'bin/kevincobain2000.email_extractor'),
         'confidence': confidence
     }
@@ -470,7 +577,7 @@ def main():
 
         print(f"Using database: {db_path}")
         print(f"Using table: {table_name}")
-        print(f"Crawl depth: {args.depth}")
+        print(f"Crawl depth: {config['depth']}")
 
         process_all_companies_from_db(scraper, db_path, table_name, args.limit, args.offset)
 

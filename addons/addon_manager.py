@@ -52,7 +52,7 @@ class AddonManager:
     def __init__(self, config: Dict[str, Any] = None, db_path: str = None):
         """
         Initialize addon manager.
-        
+
         Args:
             config: Configuration dictionary
             db_path: Path to database file
@@ -63,8 +63,15 @@ class AddonManager:
         self.finder_addons = {}
         self.checker_addons = {}
         self.max_workers = self.config.get('max_workers', 5)
-        
+
         self._load_addons()
+        self._ensure_database_setup()
+
+    def _ensure_database_setup(self):
+        """Ensure database tables are properly set up."""
+        if self.db_manager:
+            self.db_manager.ensure_emails_table()
+            self.db_manager.ensure_companies_table_columns()
     
     def _load_addons(self):
         """Load all available addons."""

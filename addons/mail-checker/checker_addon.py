@@ -179,7 +179,11 @@ class MailCheckerAddon(EmailCheckerAddon):
         spec.loader.exec_module(database_manager_module)
         EmailDatabaseManager = database_manager_module.EmailDatabaseManager
         db_manager = EmailDatabaseManager(db_path)
-        
+
+        # Ensure database tables have required schema
+        db_manager.ensure_emails_table()
+        db_manager.ensure_companies_table_columns()
+
         # Get unchecked emails
         unchecked_emails = db_manager.get_unchecked_emails(limit=limit, source=source_filter)
         

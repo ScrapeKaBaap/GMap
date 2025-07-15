@@ -62,7 +62,7 @@ class EmailDatabaseManager:
     def ensure_emails_table(self) -> bool:
         """
         Ensure the emails table exists with proper schema.
-        
+
         Returns:
             True if successful, False otherwise
         """
@@ -79,7 +79,7 @@ class EmailDatabaseManager:
                         confidence REAL DEFAULT 1.0,
                         metadata TEXT,  -- JSON
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        
+
                         -- Email validation fields
                         is_reachable TEXT,
                         mx_accepts_mail BOOLEAN,
@@ -93,21 +93,54 @@ class EmailDatabaseManager:
                         has_full_inbox BOOLEAN,
                         is_disabled BOOLEAN,
                         checked_at TIMESTAMP,
-                        
+
                         FOREIGN KEY (company_id) REFERENCES companies (id),
                         UNIQUE(company_id, email)
                     )
                 """)
-                
+
                 # Create indexes for performance
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_company_id ON emails (company_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_source ON emails (source)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_email ON emails (email)")
-                
+
                 conn.commit()
                 return True
         except sqlite3.Error as e:
             print(f"Error creating emails table: {e}")
+            return False
+
+    def ensure_companies_table_columns(self) -> bool:
+        """
+        Ensure the companies table has all required columns for email tracking.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Get current table schema
+                cursor.execute("PRAGMA table_info(companies)")
+                columns = [row[1] for row in cursor.fetchall()]
+
+                # Add missing columns
+                required_columns = {
+                    'email_methods_used': 'TEXT',  # JSON array of methods used
+                    'email_methods_completed': 'TEXT',  # JSON array of completed methods
+                    'last_email_scan': 'TIMESTAMP'  # Last time email scan was performed
+                }
+
+                for column_name, column_type in required_columns.items():
+                    if column_name not in columns:
+                        print(f"Adding missing column: {column_name}")
+                        cursor.execute(f"ALTER TABLE companies ADD COLUMN {column_name} {column_type}")
+
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            print(f"Error ensuring companies table columns: {e}")
             return False
     
     def add_email(self, company_id: int, email_result: EmailResult) -> bool:
