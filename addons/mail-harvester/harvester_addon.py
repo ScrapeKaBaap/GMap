@@ -325,9 +325,71 @@ def load_geo_mail_config():
     config.read(config_path)
     return config
 
-def process_all_companies_from_db(harvester, db_path, table_name, limit=None, offset=0):
-    """Process all companies from database."""
+def process_single_company_harvester(harvester, company_data, db_path, thread_id=None):
+    """Process a single company for email harvesting (thread-safe)."""
+
+    company_id, company_name, website = company_data
+
+    # Create a thread-local database manager for thread safety
+    # Get the correct path to addons directory
+    current_file = os.path.abspath(__file__)
+    harvester_dir = os.path.dirname(current_file)        # addons/mail-harvester
+    addons_dir = os.path.dirname(harvester_dir)          # addons
+
+    # Import directly from the addons directory
+    import importlib.util
+    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
+    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
+    database_manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(database_manager_module)
+    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
+    db_manager = EmailDatabaseManager(db_path)
+
+    thread_prefix = f"[Thread-{thread_id}] " if thread_id else ""
+
+    print(f"{thread_prefix}Processing: {company_name} ({website})")
+
+    company = CompanyInfo(
+        id=company_id,
+        name=company_name or "Unknown Company",
+        website=website
+    )
+
+    try:
+        emails = harvester.find_emails(company)
+
+        if emails:
+            # Store emails in database (thread-safe)
+            email_data = {company_id: emails}
+            added_count = db_manager.add_emails_batch(email_data)
+
+            # Update company tracking (thread-safe)
+            db_manager.update_company_methods(company_id, 'harvester', completed=True)
+
+            print(f"{thread_prefix}  Harvested {len(emails)} emails, stored {added_count} in database")
+
+            # Show all emails found
+            for email_result in emails:
+                print(f"{thread_prefix}    - {email_result.email}")
+
+            return len(emails)
+        else:
+            print(f"{thread_prefix}  No emails harvested for {website}")
+            # Still mark as completed even if no emails found
+            db_manager.update_company_methods(company_id, 'harvester', completed=True)
+            return 0
+
+    except Exception as e:
+        print(f"{thread_prefix}  Error processing {company_name}: {e}")
+        # Mark as attempted but not completed
+        db_manager.update_company_methods(company_id, 'harvester', completed=False)
+        return 0
+
+def process_all_companies_from_db(harvester, db_path, table_name, limit=None, offset=0, max_threads=2):
+    """Process all companies from database using threading."""
     import sqlite3
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # Initialize database manager for storing results and ensure schema
     # Get the correct path to addons directory
@@ -382,50 +444,37 @@ def process_all_companies_from_db(harvester, db_path, table_name, limit=None, of
         logger.info("No companies found that need harvester email generation")
         return
 
-    logger.info(f"Processing {len(companies)} companies for email harvesting...")
+    logger.info(f"Processing {len(companies)} companies for email harvesting using {max_threads} threads...")
 
     total_emails_harvested = 0
+    completed_count = 0
 
-    for i, (company_id, company_name, website) in enumerate(companies, 1):
-        print(f"Processing {i}/{len(companies)}: {company_name} ({website})")
+    # Use ThreadPoolExecutor for concurrent processing
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        # Submit all tasks
+        future_to_company = {}
+        for i, company_data in enumerate(companies):
+            thread_id = (i % max_threads) + 1
+            future = executor.submit(process_single_company_harvester, harvester, company_data, db_path, thread_id)
+            future_to_company[future] = company_data
 
-        company = CompanyInfo(
-            id=company_id,
-            name=company_name or "Unknown Company",
-            website=website
-        )
+        # Process completed tasks
+        for future in as_completed(future_to_company):
+            company_data = future_to_company[future]
+            _, company_name, _ = company_data  # Unpack only what we need
+            completed_count += 1
 
-        try:
-            emails = harvester.find_emails(company)
+            try:
+                emails_count = future.result()
+                total_emails_harvested += emails_count
+                print(f"[{completed_count}/{len(companies)}] Completed: {company_name}")
+            except Exception as e:
+                print(f"[{completed_count}/{len(companies)}] Failed: {company_name} - {e}")
 
-            if emails:
-                # Store emails in database
-                email_data = {company_id: emails}
-                added_count = db_manager.add_emails_batch(email_data)
+            # Small delay between processing completions to be respectful
+            time.sleep(1)
 
-                # Update company tracking
-                db_manager.update_company_methods(company_id, 'harvester', completed=True)
-
-                total_emails_harvested += len(emails)
-                print(f"  Harvested {len(emails)} emails, stored {added_count} in database")
-
-                # Show all emails found
-                for email_result in emails:
-                    print(f"    - {email_result.email}")
-            else:
-                print(f"  No emails harvested for {website}")
-                # Still mark as completed even if no emails found
-                db_manager.update_company_methods(company_id, 'harvester', completed=True)
-
-        except Exception as e:
-            print(f"  Error processing {company_name}: {e}")
-            # Mark as attempted but not completed
-            db_manager.update_company_methods(company_id, 'harvester', completed=False)
-
-        # Small delay between companies to be respectful
-        time.sleep(2)
-
-    print(f"\nCompleted! Harvested {total_emails_harvested} total emails for {len(companies)} companies")
+    print(f"\nCompleted! Harvested {total_emails_harvested} total emails for {len(companies)} companies using {max_threads} threads")
 
 def main():
     """Main function for standalone usage."""
@@ -440,15 +489,18 @@ def main():
     parser.add_argument("--sources", nargs='+', default=['bing', 'duckduckgo', 'yahoo'], help="Sources to use")
     parser.add_argument("--limit-per-source", type=int, default=100, help="Limit per source")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in seconds")
+    parser.add_argument("--threads", type=int, help="Number of concurrent threads for processing multiple companies")
 
     args = parser.parse_args()
 
-    # Load confidence from geo_mail config
+    # Load configuration from geo_mail config
     try:
         geo_config = load_geo_mail_config()
         confidence = geo_config.getfloat("EmailFinders", "harvester_confidence", fallback=0.8)
+        config_threads = geo_config.getint("EmailFinders", "harvester_threads", fallback=2)
     except:
         confidence = 0.8
+        config_threads = 2
 
     # Get addon directory for relative paths
     addon_dir = os.path.dirname(os.path.abspath(__file__))
@@ -462,6 +514,9 @@ def main():
         'output_dir': os.path.join(addon_dir, 'output'),
         'confidence': confidence
     }
+
+    # Use command line threads argument if provided, otherwise use config value
+    threads_to_use = args.threads if args.threads is not None else config_threads
 
     harvester = MailHarvesterAddon(config)
 
@@ -496,8 +551,9 @@ def main():
         print(f"Using database: {db_path}")
         print(f"Using table: {table_name}")
         print(f"Using sources: {args.sources}")
+        print(f"Thread count: {threads_to_use}")
 
-        process_all_companies_from_db(harvester, db_path, table_name, args.limit, args.offset)
+        process_all_companies_from_db(harvester, db_path, table_name, args.limit, args.offset, threads_to_use)
 
     elif args.company_id:
         # Process single company from database
@@ -533,6 +589,7 @@ def main():
         print("  --limit N                          Limit number of companies (optional - processes all if not set)")
         print("  --offset N                         Offset for database query")
         print("  --sources SOURCE1 SOURCE2         theHarvester sources to use")
+        print("  --threads N                        Number of concurrent threads (default: from config.ini)")
         sys.exit(1)
 
 if __name__ == "__main__":

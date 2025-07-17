@@ -396,10 +396,74 @@ def load_geo_mail_config():
     config.read(config_path)
     return config
 
-def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offset=0):
-    """Process all companies from database."""
+def process_single_company(scraper, company_data, db_path, thread_id=None):
+    """Process a single company for email scraping (thread-safe)."""
+    import time
+    import threading
+
+    company_id, company_name, website = company_data
+
+    # Create a thread-local database manager for thread safety
+    # Get the correct path to addons directory
+    current_file = os.path.abspath(__file__)
+    scraper_dir = os.path.dirname(current_file)          # addons/mail-scraper
+    addons_dir = os.path.dirname(scraper_dir)            # addons
+
+    # Import directly from the addons directory
+    import importlib.util
+    db_manager_path = os.path.join(addons_dir, 'database_manager.py')
+    spec = importlib.util.spec_from_file_location("database_manager", db_manager_path)
+    database_manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(database_manager_module)
+    EmailDatabaseManager = database_manager_module.EmailDatabaseManager
+    db_manager = EmailDatabaseManager(db_path)
+
+    thread_prefix = f"[Thread-{thread_id}] " if thread_id else ""
+
+    print(f"{thread_prefix}Processing: {company_name} ({website})")
+
+    company = CompanyInfo(
+        id=company_id,
+        name=company_name or "Unknown Company",
+        website=website
+    )
+
+    try:
+        emails = scraper.find_emails(company)
+
+        if emails:
+            # Store emails in database (thread-safe)
+            email_data = {company_id: emails}
+            added_count = db_manager.add_emails_batch(email_data)
+
+            # Update company tracking (thread-safe)
+            db_manager.update_company_methods(company_id, 'scraper', completed=True)
+
+            print(f"{thread_prefix}  Scraped {len(emails)} emails, stored {added_count} in database")
+
+            # Show all emails found
+            for email_result in emails:
+                print(f"{thread_prefix}    - {email_result.email}")
+
+            return len(emails)
+        else:
+            print(f"{thread_prefix}  No emails scraped for {website}")
+            # Still mark as completed even if no emails found
+            db_manager.update_company_methods(company_id, 'scraper', completed=True)
+            return 0
+
+    except Exception as e:
+        print(f"{thread_prefix}  Error processing {company_name}: {e}")
+        # Mark as attempted but not completed
+        db_manager.update_company_methods(company_id, 'scraper', completed=False)
+        return 0
+
+def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offset=0, max_threads=2):
+    """Process all companies from database using threading."""
     import sqlite3
     import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
 
     # Initialize database manager for storing results and ensure schema
     # Get the correct path to addons directory
@@ -454,50 +518,37 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
         print("No companies found that need scraper email generation")
         return
 
-    print(f"Processing {len(companies)} companies for email scraping...")
+    print(f"Processing {len(companies)} companies for email scraping using {max_threads} threads...")
 
     total_emails_scraped = 0
+    completed_count = 0
 
-    for i, (company_id, company_name, website) in enumerate(companies, 1):
-        print(f"Processing {i}/{len(companies)}: {company_name} ({website})")
+    # Use ThreadPoolExecutor for concurrent processing
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        # Submit all tasks
+        future_to_company = {}
+        for i, company_data in enumerate(companies):
+            thread_id = (i % max_threads) + 1
+            future = executor.submit(process_single_company, scraper, company_data, db_path, thread_id)
+            future_to_company[future] = company_data
 
-        company = CompanyInfo(
-            id=company_id,
-            name=company_name or "Unknown Company",
-            website=website
-        )
+        # Process completed tasks
+        for future in as_completed(future_to_company):
+            company_data = future_to_company[future]
+            company_id, company_name, website = company_data
+            completed_count += 1
 
-        try:
-            emails = scraper.find_emails(company)
+            try:
+                emails_count = future.result()
+                total_emails_scraped += emails_count
+                print(f"[{completed_count}/{len(companies)}] Completed: {company_name}")
+            except Exception as e:
+                print(f"[{completed_count}/{len(companies)}] Failed: {company_name} - {e}")
 
-            if emails:
-                # Store emails in database
-                email_data = {company_id: emails}
-                added_count = db_manager.add_emails_batch(email_data)
+            # Small delay between processing completions to be respectful
+            time.sleep(1)
 
-                # Update company tracking
-                db_manager.update_company_methods(company_id, 'scraper', completed=True)
-
-                total_emails_scraped += len(emails)
-                print(f"  Scraped {len(emails)} emails, stored {added_count} in database")
-
-                # Show all emails found
-                for email_result in emails:
-                    print(f"    - {email_result.email}")
-            else:
-                print(f"  No emails scraped for {website}")
-                # Still mark as completed even if no emails found
-                db_manager.update_company_methods(company_id, 'scraper', completed=True)
-
-        except Exception as e:
-            print(f"  Error processing {company_name}: {e}")
-            # Mark as attempted but not completed
-            db_manager.update_company_methods(company_id, 'scraper', completed=False)
-
-        # Small delay between companies to be respectful
-        time.sleep(3)
-
-    print(f"\nCompleted! Scraped {total_emails_scraped} total emails for {len(companies)} companies")
+    print(f"\nCompleted! Scraped {total_emails_scraped} total emails for {len(companies)} companies using {max_threads} threads")
 
 def main():
     """Main function for standalone usage."""
@@ -513,6 +564,7 @@ def main():
     parser.add_argument("--limit-emails", type=int, default=50, help="Limit emails to extract")
     parser.add_argument("--limit-urls", type=int, default=25, help="Limit URLs to crawl")
     parser.add_argument("--timeout", type=int, default=10000, help="Timeout in milliseconds")
+    parser.add_argument("--threads", type=int, help="Number of concurrent threads for processing multiple companies")
 
     args = parser.parse_args()
 
@@ -524,12 +576,16 @@ def main():
         config_limit_emails = geo_config.getint("EmailFinders", "scraper_limit_emails", fallback=50)
         config_limit_urls = geo_config.getint("EmailFinders", "scraper_limit_urls", fallback=25)
         config_timeout = geo_config.getint("EmailFinders", "scraper_timeout", fallback=10000)
+        config_sleep = geo_config.getint("EmailFinders", "scraper_sleep", fallback=1000)
+        config_threads = geo_config.getint("EmailFinders", "scraper_threads", fallback=2)
     except:
         confidence = 0.9
         config_depth = -1
         config_limit_emails = 50
         config_limit_urls = 25
         config_timeout = 10000
+        config_sleep = 1000
+        config_threads = 2
 
     # Get addon directory for relative paths
     addon_dir = os.path.dirname(os.path.abspath(__file__))
@@ -541,9 +597,13 @@ def main():
         'limit_emails': config_limit_emails if config_limit_emails != -1 else args.limit_emails,
         'limit_urls': config_limit_urls if config_limit_urls != -1 else args.limit_urls,
         'timeout': config_timeout if config_timeout != -1 else args.timeout,
+        'sleep': config_sleep,
         'extractor_bin_path': os.path.join(addon_dir, 'bin/kevincobain2000.email_extractor'),
         'confidence': confidence
     }
+
+    # Use command line threads argument if provided, otherwise use config value
+    threads_to_use = args.threads if args.threads is not None else config_threads
 
     scraper = MailScraperAddon(config)
 
@@ -578,8 +638,9 @@ def main():
         print(f"Using database: {db_path}")
         print(f"Using table: {table_name}")
         print(f"Crawl depth: {config['depth']}")
+        print(f"Thread count: {threads_to_use}")
 
-        process_all_companies_from_db(scraper, db_path, table_name, args.limit, args.offset)
+        process_all_companies_from_db(scraper, db_path, table_name, args.limit, args.offset, threads_to_use)
 
     elif args.company_id:
         # Process single company from database
@@ -615,6 +676,7 @@ def main():
         print("  --limit N                          Limit number of companies (optional - processes all if not set)")
         print("  --offset N                         Offset for database query")
         print("  --depth N                          Website crawl depth")
+        print("  --threads N                        Number of concurrent threads (default: from config.ini)")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ import sqlite3
 import json
 import sys
 import os
-from typing import List, Dict, Set, Optional, Tuple, Any
+from typing import List, Dict, Any
 from datetime import datetime
 
 # Add current directory to path for imports
@@ -92,6 +92,7 @@ class EmailDatabaseManager:
                         is_catch_all BOOLEAN,
                         has_full_inbox BOOLEAN,
                         is_disabled BOOLEAN,
+                        check_error TEXT,  -- Store error information for failed checks
                         checked_at TIMESTAMP,
 
                         FOREIGN KEY (company_id) REFERENCES companies (id),
@@ -103,6 +104,14 @@ class EmailDatabaseManager:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_company_id ON emails (company_id)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_source ON emails (source)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_email ON emails (email)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_checked_at ON emails (checked_at)")
+
+                # Ensure check_error column exists for existing databases
+                cursor.execute("PRAGMA table_info(emails)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'check_error' not in columns:
+                    print("Adding missing check_error column to emails table")
+                    cursor.execute("ALTER TABLE emails ADD COLUMN check_error TEXT")
 
                 conn.commit()
                 return True
@@ -318,7 +327,8 @@ class EmailDatabaseManager:
                     'is_deliverable': 'is_deliverable',
                     'is_catch_all': 'is_catch_all',
                     'has_full_inbox': 'has_full_inbox',
-                    'is_disabled': 'is_disabled'
+                    'is_disabled': 'is_disabled',
+                    'check_error': 'check_error'  # Store error information
                 }
                 
                 for result_key, db_column in field_mapping.items():

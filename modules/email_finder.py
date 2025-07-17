@@ -129,6 +129,7 @@ class EmailFinder:
                     'limit_emails': self.config.getint("EmailFinders", "scraper_limit_emails", fallback=50),
                     'limit_urls': self.config.getint("EmailFinders", "scraper_limit_urls", fallback=25),
                     'timeout': self.config.getint("EmailFinders", "scraper_timeout", fallback=10000),
+                    'sleep': self.config.getint("EmailFinders", "scraper_sleep", fallback=1000),
                     'extractor_bin_path': 'addons/mail-scraper/bin/kevincobain2000.email_extractor'
                 }
                 self.addons['scraper'] = MailScraperAddon(scraper_config)
