@@ -325,10 +325,24 @@ def load_geo_mail_config():
     config.read(config_path)
     return config
 
+def get_database_column_config(geo_config):
+    """Get database column configuration from config."""
+    return {
+        'table_name': geo_config.get("Database", "table_name", fallback="companies"),
+        'id_column': geo_config.get("Database", "id_column", fallback="id"),
+        'name_column': geo_config.get("Database", "name_column", fallback="name"),
+        'website_column': geo_config.get("Database", "website_column", fallback="website"),
+        'existing_emails_column': geo_config.get("Database", "existing_emails_column", fallback="").strip()
+    }
+
 def process_single_company_harvester(harvester, company_data, db_path, thread_id=None):
     """Process a single company for email harvesting (thread-safe)."""
 
     company_id, company_name, website = company_data
+
+    # Load database column configuration
+    geo_config = load_geo_mail_config()
+    db_config = get_database_column_config(geo_config)
 
     # Create a thread-local database manager for thread safety
     # Get the correct path to addons directory
@@ -343,7 +357,7 @@ def process_single_company_harvester(harvester, company_data, db_path, thread_id
     database_manager_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(database_manager_module)
     EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
+    db_manager = EmailDatabaseManager(db_path, db_config['id_column'])
 
     thread_prefix = f"[Thread-{thread_id}] " if thread_id else ""
 
@@ -391,6 +405,10 @@ def process_all_companies_from_db(harvester, db_path, table_name, limit=None, of
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    # Load database column configuration
+    geo_config = load_geo_mail_config()
+    db_config = get_database_column_config(geo_config)
+
     # Initialize database manager for storing results and ensure schema
     # Get the correct path to addons directory
     current_file = os.path.abspath(__file__)
@@ -404,7 +422,7 @@ def process_all_companies_from_db(harvester, db_path, table_name, limit=None, of
     database_manager_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(database_manager_module)
     EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
+    db_manager = EmailDatabaseManager(db_path, db_config['id_column'])
 
     # Ensure both emails table and companies table have required columns
     db_manager.ensure_emails_table()

@@ -35,6 +35,7 @@ import subprocess
 import os
 import re
 import tempfile
+import configparser
 from urllib.parse import urlparse
 from typing import List, Dict, Set, Optional, Any
 
@@ -388,7 +389,6 @@ class MailScraperAddon(EmailFinderAddon):
 
 def load_geo_mail_config():
     """Load configuration from geo_mail config/config.ini."""
-    import configparser
     # Go up two levels from addons/mail-scraper to geo_mail root
     geo_mail_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     config_path = os.path.join(geo_mail_root, 'config', 'config.ini')
@@ -396,12 +396,45 @@ def load_geo_mail_config():
     config.read(config_path)
     return config
 
+def get_database_column_config(geo_config):
+    """Get database column configuration from config."""
+    return {
+        'table_name': geo_config.get("Database", "table_name", fallback="companies"),
+        'id_column': geo_config.get("Database", "id_column", fallback="id"),
+        'name_column': geo_config.get("Database", "name_column", fallback="name"),
+        'website_column': geo_config.get("Database", "website_column", fallback="website"),
+        'existing_emails_column': geo_config.get("Database", "existing_emails_column", fallback="").strip()
+    }
+
+def parse_existing_emails(emails_str: str) -> List[str]:
+    """Parse comma-separated emails from database column."""
+    if not emails_str or not emails_str.strip():
+        return []
+    
+    emails = []
+    for email in emails_str.split(','):
+        email = email.strip().lower()
+        if email and '@' in email:
+            emails.append(email)
+    
+    return emails
+
 def process_single_company(scraper, company_data, db_path, thread_id=None):
     """Process a single company for email scraping (thread-safe)."""
     import time
     import threading
 
-    company_id, company_name, website = company_data
+    # Handle both old format (3 items) and new format (4 items with existing emails)
+    if len(company_data) == 4:
+        company_id, company_name, website, existing_emails_str = company_data
+        existing_emails = parse_existing_emails(existing_emails_str) if existing_emails_str else []
+    else:
+        company_id, company_name, website = company_data
+        existing_emails = []
+
+    # Load database column configuration
+    geo_config = load_geo_mail_config()
+    db_config = get_database_column_config(geo_config)
 
     # Create a thread-local database manager for thread safety
     # Get the correct path to addons directory
@@ -416,11 +449,13 @@ def process_single_company(scraper, company_data, db_path, thread_id=None):
     database_manager_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(database_manager_module)
     EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
+    db_manager = EmailDatabaseManager(db_path, db_config['id_column'])
 
     thread_prefix = f"[Thread-{thread_id}] " if thread_id else ""
 
     print(f"{thread_prefix}Processing: {company_name} ({website})")
+    if existing_emails:
+        print(f"{thread_prefix}  Found {len(existing_emails)} existing emails in database")
 
     company = CompanyInfo(
         id=company_id,
@@ -429,23 +464,45 @@ def process_single_company(scraper, company_data, db_path, thread_id=None):
     )
 
     try:
-        emails = scraper.find_emails(company)
+        scraped_emails = scraper.find_emails(company)
+        
+        # Combine scraped emails with existing emails (remove duplicates)
+        all_emails = list(scraped_emails)  # Start with scraped emails
+        scraped_email_set = {email.email.lower() for email in scraped_emails}
+        
+        # Add existing emails that aren't already found by scraping
+        for existing_email in existing_emails:
+            if existing_email.lower() not in scraped_email_set:
+                # Create EmailResult for existing email
+                existing_email_result = EmailResult(
+                    email=existing_email,
+                    source='existing',
+                    source_details='Pre-existing email from database',
+                    confidence=0.95,  # High confidence since it's already known
+                    metadata={'origin': 'database_column'}
+                )
+                all_emails.append(existing_email_result)
 
-        if emails:
-            # Store emails in database (thread-safe)
-            email_data = {company_id: emails}
+        total_emails = len(all_emails)
+        scraped_count = len(scraped_emails)
+        existing_count = len(existing_emails)
+        
+        if all_emails:
+            # Store all emails in database (thread-safe)
+            email_data = {company_id: all_emails}
             added_count = db_manager.add_emails_batch(email_data)
 
             # Update company tracking (thread-safe)
             db_manager.update_company_methods(company_id, 'scraper', completed=True)
 
-            print(f"{thread_prefix}  Scraped {len(emails)} emails, stored {added_count} in database")
+            print(f"{thread_prefix}  Total emails: {total_emails} (scraped: {scraped_count}, existing: {existing_count}), stored: {added_count}")
 
             # Show all emails found
-            for email_result in emails:
-                print(f"{thread_prefix}    - {email_result.email}")
+            for email_result in all_emails:
+                source_label = f"[{email_result.source}]"
+                print(f"{thread_prefix}    - {email_result.email} {source_label}")
 
-            return len(emails)
+            return total_emails
         else:
             print(f"{thread_prefix}  No emails scraped for {website}")
             # Still mark as completed even if no emails found
@@ -458,12 +515,25 @@ def process_single_company(scraper, company_data, db_path, thread_id=None):
         db_manager.update_company_methods(company_id, 'scraper', completed=False)
         return 0
 
-def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offset=0, max_threads=2):
+def process_all_companies_from_db(scraper, db_path, table_name=None, limit=None, offset=0, max_threads=2):
     """Process all companies from database using threading."""
     import sqlite3
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
+
+    # Load database column configuration
+    geo_config = load_geo_mail_config()
+    db_config = get_database_column_config(geo_config)
+    
+    # Use provided table_name or get from config
+    if table_name is None:
+        table_name = db_config['table_name']
+    
+    id_column = db_config['id_column']
+    name_column = db_config['name_column']
+    website_column = db_config['website_column']
+    existing_emails_column = db_config['existing_emails_column']
 
     # Initialize database manager for storing results and ensure schema
     # Get the correct path to addons directory
@@ -478,7 +548,7 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
     database_manager_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(database_manager_module)
     EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
+    db_manager = EmailDatabaseManager(db_path, db_config['id_column'])
 
     # Ensure both emails table and companies table have required columns
     db_manager.ensure_emails_table()
@@ -487,22 +557,27 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Build the SELECT clause with configurable column names
+    select_columns = f"{id_column}, {name_column}, {website_column}"
+    if existing_emails_column:
+        select_columns += f", {existing_emails_column}"
+
     # Get companies that need scraper email generation
     query = f"""
-        SELECT id, name, website
+        SELECT {select_columns}
         FROM {table_name}
-        WHERE website IS NOT NULL
-        AND website != ''
-        AND website != 'N/A'
-        AND website NOT LIKE '%N/A%'
-        AND website NOT LIKE 'n'
-        AND website NOT LIKE 'N'
+        WHERE {website_column} IS NOT NULL
+        AND {website_column} != ''
+        AND {website_column} != 'N/A'
+        AND {website_column} NOT LIKE '%N/A%'
+        AND {website_column} NOT LIKE 'n'
+        AND {website_column} NOT LIKE 'N'
         AND (
             email_methods_completed IS NULL
             OR email_methods_completed = '[]'
             OR json_extract(email_methods_completed, '$') NOT LIKE '%"scraper"%'
         )
-        ORDER BY id ASC
+        ORDER BY {id_column} ASC
     """
 
     if offset:
@@ -519,6 +594,11 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
         return
 
     print(f"Processing {len(companies)} companies for email scraping using {max_threads} threads...")
+    print(f"Using columns: id={id_column}, name={name_column}, website={website_column}")
+    if existing_emails_column:
+        print(f"Including existing emails from column: {existing_emails_column}")
+    else:
+        print("No existing emails column configured")
 
     total_emails_scraped = 0
     completed_count = 0
@@ -535,7 +615,11 @@ def process_all_companies_from_db(scraper, db_path, table_name, limit=None, offs
         # Process completed tasks
         for future in as_completed(future_to_company):
             company_data = future_to_company[future]
-            company_id, company_name, website = company_data
+            # Handle both old format (3 items) and new format (4 items with existing emails)
+            if len(company_data) == 4:
+                company_id, company_name, website, existing_emails_str = company_data
+            else:
+                company_id, company_name, website = company_data
             completed_count += 1
 
             try:
@@ -629,7 +713,8 @@ def main():
         # Process all companies from geo_mail database
         geo_config = load_geo_mail_config()
         db_name = geo_config.get("Database", "db_name", fallback="google_maps_companies.db")
-        table_name = geo_config.get("Email", "table_name", fallback="companies")
+        db_config = get_database_column_config(geo_config)
+        table_name = db_config['table_name']
 
         # Construct full database path (go up two levels from addons/mail-scraper to geo_mail root)
         geo_mail_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -646,25 +731,48 @@ def main():
         # Process single company from database
         geo_config = load_geo_mail_config()
         db_name = geo_config.get("Database", "db_name", fallback="google_maps_companies.db")
-        table_name = geo_config.get("Email", "table_name", fallback="companies")
+        db_config = get_database_column_config(geo_config)
+        table_name = db_config['table_name']
+        id_column = db_config['id_column']
+        name_column = db_config['name_column']
+        website_column = db_config['website_column']
+        existing_emails_column = db_config['existing_emails_column']
+        
         geo_mail_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         db_path = os.path.join(geo_mail_root, db_name)
 
         import sqlite3
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute(f"SELECT id, name, website FROM {table_name} WHERE id = ?", (args.company_id,))
+        
+        # Build SELECT query with configurable columns
+        select_columns = f"{id_column}, {name_column}, {website_column}"
+        if existing_emails_column:
+            select_columns += f", {existing_emails_column}"
+        
+        cursor.execute(f"SELECT {select_columns} FROM {table_name} WHERE {id_column} = ?", (args.company_id,))
         result = cursor.fetchone()
         conn.close()
 
         if result:
-            company_id, company_name, website = result
+            if len(result) == 4:  # includes existing emails
+                company_id, company_name, website, existing_emails_str = result
+                existing_emails = parse_existing_emails(existing_emails_str) if existing_emails_str else []
+            else:
+                company_id, company_name, website = result
+                existing_emails = []
+                
             company = CompanyInfo(id=company_id, name=company_name, website=website)
-            emails = scraper.find_emails(company)
+            scraped_emails = scraper.find_emails(company)
 
-            print(f"Scraped {len(emails)} emails for company {company_id} ({company_name}):")
-            for email_result in emails:
-                print(f"  {email_result.email}")
+            print(f"Scraped {len(scraped_emails)} emails for company {company_id} ({company_name}):")
+            for email_result in scraped_emails:
+                print(f"  {email_result.email} [scraped]")
+                
+            if existing_emails:
+                print(f"Found {len(existing_emails)} existing emails:")
+                for email in existing_emails:
+                    print(f"  {email} [existing]")
         else:
             print(f"Company with ID {args.company_id} not found")
 

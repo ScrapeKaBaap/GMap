@@ -49,17 +49,18 @@ class AddonManager:
     Provides unified interfaces for single and batch processing across all addons.
     """
     
-    def __init__(self, config: Dict[str, Any] = None, db_path: str = None):
+    def __init__(self, config: Dict[str, Any] = None, db_path: str = None, id_column: str = "id"):
         """
         Initialize addon manager.
 
         Args:
             config: Configuration dictionary
             db_path: Path to database file
+            id_column: Name of the ID column in the companies table
         """
         self.config = config or {}
         self.db_path = db_path
-        self.db_manager = EmailDatabaseManager(db_path) if db_path else None
+        self.db_manager = EmailDatabaseManager(db_path, id_column) if db_path else None
         self.finder_addons = {}
         self.checker_addons = {}
         self.max_workers = self.config.get('max_workers', 5)

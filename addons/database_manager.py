@@ -44,14 +44,16 @@ from base_addon import EmailResult, CompanyInfo
 class EmailDatabaseManager:
     """Manages database operations for the new email architecture."""
     
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, id_column: str = "id"):
         """
         Initialize database manager.
         
         Args:
             db_path: Path to the SQLite database file
+            id_column: Name of the ID column in the companies table
         """
         self.db_path = db_path
+        self.id_column = id_column
     
     def get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
@@ -380,9 +382,9 @@ class EmailDatabaseManager:
                 cursor = conn.cursor()
                 
                 # Get current methods
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT email_methods_used, email_methods_completed 
-                    FROM companies WHERE id = ?
+                    FROM companies WHERE {self.id_column} = ?
                 """, (company_id,))
                 
                 row = cursor.fetchone()
@@ -402,12 +404,12 @@ class EmailDatabaseManager:
                     completed_methods.append(method)
                 
                 # Update database
-                cursor.execute("""
+                cursor.execute(f"""
                     UPDATE companies 
                     SET email_methods_used = ?, 
                         email_methods_completed = ?,
                         last_email_scan = ?
-                    WHERE id = ?
+                    WHERE {self.id_column} = ?
                 """, (
                     json.dumps(used_methods),
                     json.dumps(completed_methods),

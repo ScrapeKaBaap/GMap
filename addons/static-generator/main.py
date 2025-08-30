@@ -245,9 +245,45 @@ def load_geo_mail_config():
     config.read(config_path)
     return config
 
-def process_all_companies_from_db(generator, db_path, table_name, limit=None, offset=0):
+def get_database_column_config(geo_config):
+    """Get database column configuration from config."""
+    return {
+        'table_name': geo_config.get("Database", "table_name", fallback="companies"),
+        'id_column': geo_config.get("Database", "id_column", fallback="id"),
+        'name_column': geo_config.get("Database", "name_column", fallback="name"),
+        'website_column': geo_config.get("Database", "website_column", fallback="website"),
+        'existing_emails_column': geo_config.get("Database", "existing_emails_column", fallback="").strip()
+    }
+
+def parse_existing_emails(emails_str: str) -> List[str]:
+    """Parse comma-separated emails from database column."""
+    if not emails_str or not emails_str.strip():
+        return []
+    
+    emails = []
+    for email in emails_str.split(','):
+        email = email.strip().lower()
+        if email and '@' in email:
+            emails.append(email)
+    
+    return emails
+
+def process_all_companies_from_db(generator, db_path, table_name=None, limit=None, offset=0):
     """Process all companies from database."""
     import sqlite3
+
+    # Load database column configuration
+    geo_config = load_geo_mail_config()
+    db_config = get_database_column_config(geo_config)
+    
+    # Use provided table_name or get from config
+    if table_name is None:
+        table_name = db_config['table_name']
+    
+    id_column = db_config['id_column']
+    name_column = db_config['name_column']
+    website_column = db_config['website_column']
+    existing_emails_column = db_config['existing_emails_column']
 
     # Initialize database manager for storing results and ensure schema
     # Get the geo_mail root directory (parent of addons)
@@ -263,7 +299,7 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
     database_manager_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(database_manager_module)
     EmailDatabaseManager = database_manager_module.EmailDatabaseManager
-    db_manager = EmailDatabaseManager(db_path)
+    db_manager = EmailDatabaseManager(db_path, db_config['id_column'])
 
     # Ensure both emails table and companies table have required columns
     db_manager.ensure_emails_table()
@@ -272,22 +308,27 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Build the SELECT clause with configurable column names
+    select_columns = f"{id_column}, {name_column}, {website_column}"
+    if existing_emails_column:
+        select_columns += f", {existing_emails_column}"
+
     # Get companies that need static email generation
     query = f"""
-        SELECT id, name, website
+        SELECT {select_columns}
         FROM {table_name}
-        WHERE website IS NOT NULL
-        AND website != ''
-        AND website != 'N/A'
-        AND website NOT LIKE '%N/A%'
-        AND website NOT LIKE 'n'
-        AND website NOT LIKE 'N'
+        WHERE {website_column} IS NOT NULL
+        AND {website_column} != ''
+        AND {website_column} != 'N/A'
+        AND {website_column} NOT LIKE '%N/A%'
+        AND {website_column} NOT LIKE 'n'
+        AND {website_column} NOT LIKE 'N'
         AND (
             email_methods_completed IS NULL
             OR email_methods_completed = '[]'
             OR json_extract(email_methods_completed, '$') NOT LIKE '%"static"%'
         )
-        ORDER BY id ASC
+        ORDER BY {id_column} ASC
     """
 
     if offset:
@@ -304,11 +345,26 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
         return
 
     logger.info(f"Processing {len(companies)} companies for static email generation...")
+    logger.info(f"Using columns: id={id_column}, name={name_column}, website={website_column}")
+    if existing_emails_column:
+        logger.info(f"Including existing emails from column: {existing_emails_column}")
+    else:
+        logger.info("No existing emails column configured")
 
     total_emails_generated = 0
 
-    for i, (company_id, company_name, website) in enumerate(companies, 1):
+    for i, company_data in enumerate(companies, 1):
+        # Handle both old format (3 items) and new format (4 items with existing emails)
+        if len(company_data) == 4:
+            company_id, company_name, website, existing_emails_str = company_data
+            existing_emails = parse_existing_emails(existing_emails_str) if existing_emails_str else []
+        else:
+            company_id, company_name, website = company_data
+            existing_emails = []
+
         logger.info(f"Processing {i}/{len(companies)}: {company_name} ({website})")
+        if existing_emails:
+            logger.info(f"  Found {len(existing_emails)} existing emails in database")
 
         company = CompanyInfo(
             id=company_id,
@@ -317,24 +373,46 @@ def process_all_companies_from_db(generator, db_path, table_name, limit=None, of
         )
 
         try:
-            emails = generator.find_emails(company)
+            generated_emails = generator.find_emails(company)
+            
+            # Combine generated emails with existing emails (remove duplicates)
+            all_emails = list(generated_emails)  # Start with generated emails
+            generated_email_set = {email.email.lower() for email in generated_emails}
+            
+            # Add existing emails that aren't already generated
+            for existing_email in existing_emails:
+                if existing_email.lower() not in generated_email_set:
+                    # Create EmailResult for existing email
+                    existing_email_result = EmailResult(
+                        email=existing_email,
+                        source='existing',
+                        source_details='Pre-existing email from database',
+                        confidence=0.95,  # High confidence since it's already known
+                        metadata={'origin': 'database_column'}
+                    )
+                    all_emails.append(existing_email_result)
 
-            if emails:
-                # Store emails in database
-                email_data = {company_id: emails}
+            total_emails = len(all_emails)
+            generated_count = len(generated_emails)
+            existing_count = len(existing_emails)
+
+            if all_emails:
+                # Store all emails in database
+                email_data = {company_id: all_emails}
                 added_count = db_manager.add_emails_batch(email_data)
 
                 # Update company tracking
                 db_manager.update_company_methods(company_id, 'static', completed=True)
 
-                total_emails_generated += len(emails)
-                logger.info(f"  Generated {len(emails)} emails, stored {added_count} in database")
+                total_emails_generated += total_emails
+                logger.info(f"  Total emails: {total_emails} (generated: {generated_count}, existing: {existing_count}), stored: {added_count}")
 
                 # Show first few emails
-                for email_result in emails[:3]:
-                    logger.info(f"    - {email_result.email} (confidence: {email_result.confidence:.2f})")
-                if len(emails) > 3:
-                    logger.info(f"    ... and {len(emails) - 3} more")
+                for email_result in all_emails[:3]:
+                    source_label = f"[{email_result.source}]"
+                    logger.info(f"    - {email_result.email} (confidence: {email_result.confidence:.2f}) {source_label}")
+                if len(all_emails) > 3:
+                    logger.info(f"    ... and {len(all_emails) - 3} more")
             else:
                 logger.info(f"  No emails generated for {website}")
                 # Still mark as completed even if no emails found
@@ -392,7 +470,8 @@ def main():
         # Process all companies from geo_mail database
         geo_config = load_geo_mail_config()
         db_name = geo_config.get("Database", "db_name", fallback="google_maps_companies.db")
-        table_name = geo_config.get("Email", "table_name", fallback="companies")
+        db_config = get_database_column_config(geo_config)
+        table_name = db_config['table_name']
 
         # Construct full database path (go up two levels from addons/static-generator to geo_mail root)
         geo_mail_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -407,25 +486,48 @@ def main():
         # Process single company from database
         geo_config = load_geo_mail_config()
         db_name = geo_config.get("Database", "db_name", fallback="google_maps_companies.db")
-        table_name = geo_config.get("Email", "table_name", fallback="companies")
+        db_config = get_database_column_config(geo_config)
+        table_name = db_config['table_name']
+        id_column = db_config['id_column']
+        name_column = db_config['name_column']
+        website_column = db_config['website_column']
+        existing_emails_column = db_config['existing_emails_column']
+        
         geo_mail_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         db_path = os.path.join(geo_mail_root, db_name)
 
         import sqlite3
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute(f"SELECT id, name, website FROM {table_name} WHERE id = ?", (args.company_id,))
+        
+        # Build SELECT query with configurable columns
+        select_columns = f"{id_column}, {name_column}, {website_column}"
+        if existing_emails_column:
+            select_columns += f", {existing_emails_column}"
+        
+        cursor.execute(f"SELECT {select_columns} FROM {table_name} WHERE {id_column} = ?", (args.company_id,))
         result = cursor.fetchone()
         conn.close()
 
         if result:
-            company_id, company_name, website = result
+            if len(result) == 4:  # includes existing emails
+                company_id, company_name, website, existing_emails_str = result
+                existing_emails = parse_existing_emails(existing_emails_str) if existing_emails_str else []
+            else:
+                company_id, company_name, website = result
+                existing_emails = []
+                
             company = CompanyInfo(id=company_id, name=company_name, website=website)
-            emails = generator.find_emails(company)
+            generated_emails = generator.find_emails(company)
 
-            print(f"Generated {len(emails)} emails for company {company_id} ({company_name}):")
-            for email_result in emails:
-                print(f"  {email_result.email} (confidence: {email_result.confidence:.2f})")
+            print(f"Generated {len(generated_emails)} emails for company {company_id} ({company_name}):")
+            for email_result in generated_emails:
+                print(f"  {email_result.email} (confidence: {email_result.confidence:.2f}) [generated]")
+                
+            if existing_emails:
+                print(f"Found {len(existing_emails)} existing emails:")
+                for email in existing_emails:
+                    print(f"  {email} [existing]")
         else:
             print(f"Company with ID {args.company_id} not found")
 
