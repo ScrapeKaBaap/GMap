@@ -144,6 +144,27 @@ run_inline = true
 static_enabled = true
 ```
 
+### 📧 **2.5. Email Validation Service (Optional but Recommended)**
+
+For email validation functionality, start the email checking service:
+
+```bash
+# Option A: Using Docker (Recommended)
+docker run -d -p 8080:8080 reacherhq/backend:latest
+
+# Option B: Check if service is already running
+curl http://localhost:8080/v0/check_email -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"to_email": "test@example.com"}'
+```
+
+**Enable email checking in config:**
+```ini
+[EmailChecker]
+enabled = true
+api_endpoint = http://localhost:8080/v0/check_email
+```
+
 ### 🏃 **3. Run Your First Scrape**
 
 ```bash
@@ -276,6 +297,31 @@ Scraped 7 emails from techcorp.com:
 - Validates email syntax and deliverability
 - Checks MX records and SMTP connectivity
 - Identifies disposable and role-based emails
+- Detects catch-all domains and full inboxes
+- Provides detailed reachability scoring
+
+**📋 Requirements:**
+
+**1. Python Dependencies:**
+- `requests` - for HTTP API calls
+- Standard library modules included
+
+**2. External Email Validation Service:**
+The addon requires an email validation API service running on `http://localhost:8080/v0/check_email` (configurable).
+
+**📦 Setup Options:**
+
+**Option A: Docker (Recommended)**
+```bash
+# Start Reacher email validation service
+docker run -d -p 8080:8080 reacherhq/backend:latest
+```
+
+**Option B: Use Existing Binary**
+```bash
+# You have check_if_email_exists binary in /home/kay/work/scrape/reacher-email/
+# But this is CLI-only, you need the server version for the addon
+```
 
 **⚙️ Configuration:**
 ```ini
@@ -284,6 +330,7 @@ enabled = true
 api_endpoint = http://localhost:8080/v0/check_email
 batch_size = 200
 max_workers = 10
+api_timeout = 3600
 ```
 
 **🚀 Standalone Usage:**
@@ -300,7 +347,25 @@ Checked 150 emails:
   ✅ 120 deliverable
   ❌ 20 undeliverable  
   ⚠️ 10 risky
+
+EMAIL CHECKING STATISTICS
+==================================================
+Total emails in database: 1000
+Checked emails: 150
+Unchecked emails: 850
+Emails with errors: 5
+
+Emails by source:
+  static: 400
+  harvester: 300
+  scraper: 300
+==================================================
 ```
+
+**🔧 Troubleshooting:**
+- **Connection Error:** Ensure the email validation service is running on port 8080
+- **Timeout Issues:** Increase `api_timeout` in configuration
+- **Rate Limiting:** Reduce `batch_size` and `max_workers`
 
 ---
 
@@ -528,6 +593,73 @@ max_workers = 20               # More concurrent workers
 - Implement proper error handling
 - Monitor for rate limiting responses
 - Respect website terms of service
+
+---
+
+## 🔧 **Troubleshooting**
+
+### 📧 **Email Checker Issues**
+
+**Problem: "Connection Error" when checking emails**
+```bash
+# Check if email validation service is running
+curl http://localhost:8080/health
+
+# Start the service if not running
+docker run -d -p 8080:8080 reacherhq/backend:latest
+
+# Test the service
+python addons/mail-checker/checker_addon.py --email test@example.com
+```
+
+**Problem: "Timeout" errors during bulk checking**
+```ini
+# Increase timeout in config/config.ini
+[EmailChecker]
+api_timeout = 7200  # 2 hours instead of 1
+batch_size = 50     # Reduce batch size
+max_workers = 5     # Reduce concurrent workers
+```
+
+**Problem: Email checker not finding unchecked emails**
+```bash
+# Check database statistics
+python addons/mail-checker/checker_addon.py --stats
+
+# Run email discovery first
+python src/main.py  # This populates the emails table
+```
+
+**Problem: Docker port conflicts**
+```bash
+# Use different port if 8080 is busy
+docker run -d -p 8081:8080 reacherhq/backend:latest
+
+# Update config to match
+[EmailChecker]
+api_endpoint = http://localhost:8081/v0/check_email
+```
+
+### 🌐 **Browser & Scraping Issues**
+
+**Problem: Browser fails to start**
+```bash
+# Reinstall Playwright browsers
+playwright install
+
+# Check system dependencies
+playwright install-deps
+```
+
+**Problem: Rate limiting from Google Maps**
+```ini
+# Reduce parallel requests in config/config.ini
+[Playwright]
+parallel_query_count = 1  # More conservative
+
+# Add longer delays
+scroll_wait_time = 5000
+```
 
 ---
 
